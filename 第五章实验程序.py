@@ -10,6 +10,7 @@ import math
 import platform
 import statistics
 import time
+from fractions import Fraction
 
 
 T = 0.1
@@ -96,17 +97,208 @@ def dst_coefficient(values: list[float], n: int, mode: int) -> float:
                         for i, value in enumerate(values, 1)) / n
 
 
-def multimode_experiment() -> dict:
+def predict_first_negative_step(a: float, rho: float) -> int | None:
+    """First negative step when g1 > 0 and rho > 1; None if rho <= 1.
+
+    Equality a*rho**n == 1 gives zero, not a strictly negative node.
+    Exact rational comparisons of the supplied floats correct logarithmic
+    rounding at integer thresholds (intended for modest experiment step counts).
+    """
+    if not math.isfinite(a) or not 0 < a < 1:
+        raise ValueError("a must be finite and strictly between zero and one")
+    if not math.isfinite(rho) or rho <= 0:
+        raise ValueError("rho must be finite and positive")
+    if rho <= 1:
+        return None
+    step = math.floor(-math.log(a) / math.log1p(rho - 1)) + 1
+    exact_a, exact_rho = Fraction(a), Fraction(rho)
+    while exact_a * exact_rho ** step <= 1:
+        step += 1
+    while step > 1 and exact_a * exact_rho ** (step - 1) > 1:
+        step -= 1
+    return step
+
+
+def complete_negative_classification(n: int, r: float, a: float) -> dict:
+    """Classify first strict negativity for the lowest/highest two-mode family."""
+    if not isinstance(n, int) or n < 3:
+        raise ValueError("n must be an integer at least three")
+    if not math.isfinite(r) or r <= 0:
+        raise ValueError("r must be finite and positive")
+    if not math.isfinite(a) or not 0 < a < 1:
+        raise ValueError("a must be finite and strictly between zero and one")
+    s = math.sin(math.pi / (2 * n))
+    c = math.cos(math.pi / (2 * n))
+    r_star = 1 / math.sin(math.pi / n)
+    r_double_star = 1 / (2 * s * s)
+    if r <= r_star:
+        interval, n_neg = "0 < r <= r_star", None
+    elif r < r_double_star:
+        g1 = (1 - 2 * r * s * s) / (1 + 2 * r * s * s)
+        gH = (1 - 2 * r * c * c) / (1 + 2 * r * c * c)
+        interval = "r_star < r < r_double_star"
+        n_neg = predict_first_negative_step(a, abs(gH) / g1)
+    else:
+        interval, n_neg = "r >= r_double_star", 1
+    return {"interval": interval, "n_neg": n_neg,
+            "r_star": r_star, "r_double_star": r_double_star}
+
+
+def first_negative_validation() -> dict:
+    """Observe first negativity from full CN grid snapshots, not modal values."""
+    n, r, steps, negative_tolerance = 40, 40.0, 8, 1e-12
+    final_time = steps * r / n**2
+    g1 = factor(n, steps, "CN", final_time, 1)
+    gH = factor(n, steps, "CN", final_time, n - 1)
+    assert g1 > 0 and gH < 0
+    rho = abs(gH) / g1
+    # An exact integer threshold and its immediate floating-point neighbors.
+    assert predict_first_negative_step(0.25, 2.0) == 3
+    assert predict_first_negative_step(math.nextafter(0.25, 1.0), 2.0) == 2
+    assert predict_first_negative_step(math.nextafter(0.25, 0.0), 2.0) == 3
+    assert predict_first_negative_step(0.5, 1.0) is None
+    assert predict_first_negative_step(0.5, 0.9) is None
+    assert complete_negative_classification(n, 0.4, 0.5)["n_neg"] is None
+    assert complete_negative_classification(n, 1 / math.sin(math.pi / n), 0.5)["n_neg"] is None
+    assert complete_negative_classification(n, r, 0.5)["n_neg"] == 4
+    low, high = initial_mode(n), initial_mode(n, n - 1)
+    rows = []
+    for a, expected in ((0.25, 7), (0.50, 4), (0.75, 2)):
+        initial = [lo + a * hi for lo, hi in zip(low, high)]
+        assert min(initial) > 0
+        theoretical = predict_first_negative_step(a, rho)
+        assert theoretical == expected
+        snapshots: list[list[float]] = []
+        solve("CN", n, steps, final_time, initial_values=initial,
+              snapshots=snapshots)
+        minima = [min(values) for values in snapshots]
+        observed = next((j for j, value in enumerate(minima)
+                         if value < -negative_tolerance), None)
+        assert observed == theoretical
+        assert observed is not None
+        negative_nodes = []
+        for j, values in enumerate(snapshots):
+            nodes = [i for i, value in enumerate(values, 1)
+                     if value < -negative_tolerance]
+            expected_nodes = ([i for i in range(1, n) if i % 2 == j % 2]
+                              if j >= theoretical else [])
+            assert nodes == expected_nodes, (a, j, nodes)
+            negative_nodes.append(nodes)
+            for i, value in enumerate(values, 1):
+                predicted = low[i - 1] * (g1**j + a * (-1)**(i + 1) * gH**j)
+                assert abs(value - predicted) < 2e-12, (a, j, i)
+        center_predicted = g1**8 - a * abs(gH)**8
+        center_observed = snapshots[8][n // 2 - 1]
+        assert abs(center_observed - center_predicted) < 2e-12
+        rows.append({"a": a, "rho": rho, "theoretical_n_neg": theoretical,
+                     "observed_n_neg": observed, "matches": observed == theoretical,
+                     "initial_min": min(initial), "grid_min_by_step": minima,
+                     "negative_nodes_by_step": negative_nodes,
+                     "center_step_8_predicted": center_predicted,
+                     "center_step_8_observed": center_observed})
+    # Extend the same step size to T=0.45; keep the original six-case T=0.2
+    # experiment and its eight-step first-negativity records untouched.
+    envelope_steps, envelope_a = 18, 0.5
+    envelope_snapshots: list[list[float]] = []
+    envelope_initial = [lo + envelope_a * hi for lo, hi in zip(low, high)]
+    solve("CN", n, envelope_steps, envelope_steps * r / n**2,
+          initial_values=envelope_initial, snapshots=envelope_snapshots)
+    min_by_step = [min(values) for values in envelope_snapshots]
+    argmin_by_step = [values.index(min(values)) + 1 for values in envelope_snapshots]
+    n_neg = complete_negative_classification(n, r, envelope_a)["n_neg"]
+    assert n_neg == 4
+    n_star = math.log(math.log(g1) / (envelope_a * math.log(abs(gH)))) / math.log(rho)
+    def phi(j: int) -> float:
+        return envelope_a * abs(gH)**j - g1**j
+    peak_step_envelope = max((math.floor(n_star), math.ceil(n_star)), key=phi)
+    peak_step_theory = max(range(n_neg, envelope_steps + 1),
+                           key=lambda j: phi(j) * max(low[i - 1]
+                               for i in range(1, n) if i % 2 == j % 2))
+    peak_step_observed = min(range(n_neg, envelope_steps + 1),
+                             key=lambda j: min_by_step[j])
+    peak_node_factor = max(low[i - 1] for i in range(1, n)
+                           if i % 2 == peak_step_theory % 2)
+    peak_amplitude_theory = phi(peak_step_theory) * peak_node_factor
+    peak_amplitude_observed = -min_by_step[peak_step_observed]
+    assert abs(n_star - 13.3982658652422) < 1e-10
+    assert abs(phi(13) - 0.32121590446103) < 1e-10
+    assert abs(phi(14) - 0.321037895996849) < 1e-10
+    assert peak_step_envelope == 13
+    assert peak_step_theory == peak_step_observed == 14
+    assert argmin_by_step[13] == 19 and argmin_by_step[14] == 20
+    assert abs(min_by_step[13] + 0.320225703028) < 1e-10
+    assert abs(min_by_step[14] + 0.321037895996849) < 1e-10
+    assert abs(peak_amplitude_observed - peak_amplitude_theory) < 1e-10
+    assert abs(min_by_step[8] - rows[1]["center_step_8_observed"]) < 1e-12
+    for j, values in enumerate(envelope_snapshots):
+        for i, value in enumerate(values, 1):
+            predicted = low[i - 1] * (g1**j + envelope_a * (-1)**(i + 1) * gH**j)
+            assert abs(value - predicted) < 2e-12, (j, i)
+    for row in rows:
+        a = row["a"]
+        long_snapshots: list[list[float]] = []
+        if a == envelope_a:
+            long_snapshots = envelope_snapshots
+        else:
+            initial = [lo + a * hi for lo, hi in zip(low, high)]
+            solve("CN", n, envelope_steps, envelope_steps * r / n**2,
+                  initial_values=initial, snapshots=long_snapshots)
+        long_minima = [min(values) for values in long_snapshots]
+        peak_step = min(range(row["theoretical_n_neg"], envelope_steps + 1),
+                        key=lambda j: long_minima[j])
+        row["deepest_step_through_18"] = peak_step
+        row["deepest_min_through_18"] = long_minima[peak_step]
+        assert peak_step < envelope_steps
+        assert abs(long_minima[peak_step] - min(
+            low[i - 1] * (g1**peak_step + a * (-1)**(i + 1) * gH**peak_step)
+            for i in range(1, n))) < 1e-10
+
+    r_double_star = complete_negative_classification(n, r, envelope_a)["r_double_star"]
+    third_interval = []
+    for large_r in (r_double_star, 400.0, 1000.0):
+        check = complete_negative_classification(n, large_r, envelope_a)
+        assert check["interval"] == "r >= r_double_star" and check["n_neg"] == 1
+        snapshots: list[list[float]] = []
+        solve("CN", n, 1, large_r / n**2,
+              initial_values=envelope_initial, snapshots=snapshots)
+        odd_nodes = [i for i in range(1, n) if i % 2 == 1]
+        assert all(snapshots[1][i - 1] < 0 for i in odd_nodes)
+        first_min = min(snapshots[1])
+        argmin = snapshots[1].index(first_min) + 1
+        assert argmin == 19
+        third_interval.append({"r": large_r, "n_neg": check["n_neg"],
+                               "all_odd_negative_step_1": True,
+                               "min_step_1": first_min, "argmin_step_1": argmin})
+
+    return {"N": n, "r": r, "steps": steps, "g1": g1, "gH": gH,
+            "rho": rho, "negative_tolerance": negative_tolerance, "cases": rows,
+            "negative_envelope": {
+                "T": 0.45, "M": envelope_steps, "dt": r / n**2,
+                "a": envelope_a, "n_star": n_star,
+                "peak_step_envelope": peak_step_envelope,
+                "phi_13": phi(13), "phi_14": phi(14),
+                "peak_step_theory": peak_step_theory,
+                "peak_step_observed": peak_step_observed,
+                "peak_amplitude_theory": peak_amplitude_theory,
+                "peak_amplitude_observed": peak_amplitude_observed,
+                "min_by_step": min_by_step,
+                "argmin_by_step": argmin_by_step},
+            "third_interval_checks": third_interval}
+
+
+def multimode_experiment(a: float = 0.5) -> dict:
     """Run both step sizes on the full grid and verify resolvable DST values."""
     n, final_time = 40, 0.2
     low, high = initial_mode(n), initial_mode(n, n - 1)
-    initial = [a + 0.5 * b for a, b in zip(low, high)]
+    if not math.isfinite(a) or not 0 < a < 1:
+        raise ValueError("a must be finite and strictly between zero and one")
+    initial = [lo + a * hi for lo, hi in zip(low, high)]
     assert min(initial) > 0
-    exact = [math.exp(-PI2 * final_time) * a
-             + 0.5 * math.exp(-(n - 1) ** 2 * PI2 * final_time) * b
-             for a, b in zip(low, high)]
+    exact = [math.exp(-PI2 * final_time) * lo
+             + a * math.exp(-(n - 1) ** 2 * PI2 * final_time) * hi
+             for lo, hi in zip(low, high)]
     result = {"N": n, "T": final_time, "initial_min": min(initial),
-              "cases": {}}
+              "a": a, "cases": {}}
     for steps in (800, 8):
         r = n * n * final_time / steps
         group = {}
@@ -121,10 +313,10 @@ def multimode_experiment() -> dict:
             # The endpoint may underflow. The logarithm retains the formula's scale.
             log10_high_ratio = steps * math.log10(abs(g39))
             predicted_low = g1 ** steps
-            predicted_high = 0.5 * g39 ** steps
+            predicted_high = a * g39 ** steps
             predicted_energy = (predicted_low ** 2 + predicted_high ** 2) / 4
             predicted_error = math.sqrt(((predicted_low - math.exp(-PI2 * final_time)) ** 2
-                                         + (predicted_high - 0.5 * math.exp(-(n - 1) ** 2 * PI2 * final_time)) ** 2) / 2)
+                                         + (predicted_high - a * math.exp(-(n - 1) ** 2 * PI2 * final_time)) ** 2) / 2)
             assert abs(energies[-1] - predicted_energy) <= 1e-10 * max(1, predicted_energy)
             assert abs(error - predicted_error) <= 1e-10 * max(1, predicted_error)
             checked = []
@@ -132,7 +324,7 @@ def multimode_experiment() -> dict:
                 projected_low = dst_coefficient(values, n, 1)
                 projected_high = dst_coefficient(values, n, n - 1)
                 expected_low = g1 ** j
-                expected_high = 0.5 * g39 ** j
+                expected_high = a * g39 ** j
                 if abs(expected_high) > 1e-12 * max(1, abs(expected_low)):
                     assert abs(projected_high - expected_high) <= 2e-10 * max(1, abs(expected_high)), (steps, method, j)
                     checked.append(j)
@@ -153,7 +345,8 @@ def multimode_experiment() -> dict:
             }
         group["r"] = r
         result["cases"][str(steps)] = group
-    assert result["cases"]["8"]["CN"]["first_negative_step"] == 4
+    if a == 0.5:
+        assert result["cases"]["8"]["CN"]["first_negative_step"] == 4
     return result
 
 
@@ -236,6 +429,7 @@ def main() -> None:
         assert abs(energies[-1] / energies[0] / abs(g) ** 80 - 1) < 1e-10
 
     result["multimode"] = multimode_experiment()
+    result["multimode"]["first_negative_validation"] = first_negative_validation()
 
     n = 80
     tolerance = 2e-4
